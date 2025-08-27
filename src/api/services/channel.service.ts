@@ -507,7 +507,8 @@ export class ChannelStartupService {
       where,
     };
 
-    if (query.offset) contactFindManyArgs.take = query.offset;
+    if (query.offset) contactFindManyArgs.skip = query.offset;
+    if (query.limit) contactFindManyArgs.take = query.limit;
     if (query.page) {
       const validPage = Math.max(query.page as number, 1);
       contactFindManyArgs.skip = query.offset * (validPage - 1);

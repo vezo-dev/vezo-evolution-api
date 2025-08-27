@@ -7,6 +7,7 @@ export class Query<T> {
   sort?: 'asc' | 'desc';
   page?: number;
   offset?: number;
+  limit?: number;
 }
 
 export class PrismaRepository extends PrismaClient {
