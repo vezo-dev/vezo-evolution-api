@@ -507,8 +507,7 @@ export class ChannelStartupService {
       where,
     };
 
-    if (query.offset) contactFindManyArgs.skip = query.offset;
-    if (query.limit) contactFindManyArgs.take = query.limit;
+    if (query.offset) contactFindManyArgs.take = query.offset;
     if (query.page) {
       const validPage = Math.max(query.page as number, 1);
       contactFindManyArgs.skip = query.offset * (validPage - 1);
@@ -814,4 +813,196 @@ export class ChannelStartupService {
 
     return [];
   }
+
+  public async fetchVezoChats(query: {
+    where?: {
+      remoteJid?: string;
+      messageTimestamp?: { gte?: string | Date; lte?: string | Date };
+    };
+    take?: number;
+    skip?: number;
+  }) {
+    // --- filtros e paginação (sem non-null assertion) ---
+    const remoteJid =
+      query?.where?.remoteJid
+        ? (query.where.remoteJid.includes('@') ? query.where.remoteJid : createJid(query.where.remoteJid))
+        : null;
+
+    const gte =
+      query?.where?.messageTimestamp?.gte != null
+        ? Math.floor(new Date(query.where!.messageTimestamp!.gte as any).getTime() / 1000)
+        : undefined;
+
+    const lte =
+      query?.where?.messageTimestamp?.lte != null
+        ? Math.floor(new Date(query.where!.messageTimestamp!.lte as any).getTime() / 1000)
+        : undefined;
+
+    const hasTsFilter = gte != null && lte != null;
+
+    const tsFilter = hasTsFilter
+      ? Prisma.sql`AND m."messageTimestamp" >= ${gte!} AND m."messageTimestamp" <= ${lte!}`
+      : Prisma.sql``;
+
+    const take = Number.isFinite(query?.take) ? Number(query!.take) : 20;
+    const skip = Number.isFinite(query?.skip) ? Number(query!.skip) : 0;
+
+    const limitSql = Prisma.sql`LIMIT ${take}`;
+    const offsetSql = Prisma.sql`OFFSET ${skip}`;
+
+    // --- página de dados ---
+    const rows = await this.prismaRepository.$queryRaw<Array<{
+      contactId: string | null;
+      remoteJid: string;
+      pushName: string | null;
+      profilePicUrl: string | null;
+      updatedAt: Date | null;
+      isGroup: boolean;
+
+      lastMessageId: string | null;
+      lastMessageKey: Prisma.JsonValue | null;
+      lastMessagePushName: string | null;
+      lastMessageParticipant: string | null;
+      lastMessageMessageType: string | null;
+      lastMessageMessage: Prisma.JsonValue | null;
+      lastMessageContextInfo: Prisma.JsonValue | null;
+      lastMessageSource: string | null;
+      lastMessageMessageTimestamp: number | null;
+      lastMessageInstanceId: string | null;
+      lastMessageSessionId: string | null;
+      lastMessageStatus: string | null;
+    }>>`
+      WITH last_msg AS (
+        SELECT DISTINCT ON (m."key"->>'remoteJid')
+          m."key"->>'remoteJid'                    AS "remoteJid",
+          m."id"                                   AS "lastMessageId",
+          m."key"                                  AS "lastMessageKey",
+          CASE WHEN m."key"->>'fromMe' = 'true'
+              THEN 'Você' ELSE m."pushName" END   AS "lastMessagePushName",
+          m."participant"                          AS "lastMessageParticipant",
+          m."messageType"                          AS "lastMessageMessageType",
+          m."message"                              AS "lastMessageMessage",
+          m."contextInfo"                          AS "lastMessageContextInfo",
+          m."source"                               AS "lastMessageSource",
+          m."messageTimestamp"                     AS "lastMessageMessageTimestamp",
+          m."instanceId"                           AS "lastMessageInstanceId",
+          m."sessionId"                            AS "lastMessageSessionId",
+          m."status"                               AS "lastMessageStatus"
+        FROM "Message" m
+        WHERE m."instanceId" = ${this.instanceId}
+          ${remoteJid ? Prisma.sql`AND m."key"->>'remoteJid' = ${remoteJid}` : Prisma.sql``}
+          ${tsFilter}
+        ORDER BY m."key"->>'remoteJid', m."messageTimestamp" DESC
+      )
+      SELECT
+        c."id"                                     AS "contactId",
+        COALESCE(lm."remoteJid", c."remoteJid")    AS "remoteJid",
+        CASE
+          WHEN COALESCE(lm."remoteJid", c."remoteJid") LIKE '%@g.us'
+            THEN COALESCE(ch."name", c."pushName")
+          ELSE COALESCE(c."pushName", lm."lastMessagePushName")
+        END                                         AS "pushName",
+        c."profilePicUrl"                           AS "profilePicUrl",
+        COALESCE(
+          CASE WHEN lm."lastMessageMessageTimestamp" IS NOT NULL
+              THEN to_timestamp(lm."lastMessageMessageTimestamp"::double precision)
+              ELSE NULL
+          END,
+          c."updatedAt"
+        )                                           AS "updatedAt",
+        (COALESCE(lm."remoteJid", c."remoteJid") LIKE '%@g.us') AS "isGroup",
+
+        lm."lastMessageId",
+        lm."lastMessageKey",
+        lm."lastMessagePushName",
+        lm."lastMessageParticipant",
+        lm."lastMessageMessageType",
+        lm."lastMessageMessage",
+        lm."lastMessageContextInfo",
+        lm."lastMessageSource",
+        lm."lastMessageMessageTimestamp",
+        lm."lastMessageInstanceId",
+        lm."lastMessageSessionId",
+        lm."lastMessageStatus"
+      FROM "Contact" c
+      ${hasTsFilter
+        ? Prisma.sql`INNER JOIN last_msg lm ON lm."remoteJid" = c."remoteJid"`
+        : Prisma.sql`LEFT JOIN  last_msg lm ON lm."remoteJid" = c."remoteJid"`}
+      LEFT JOIN "Chat" ch
+        ON ch."remoteJid" = COALESCE(lm."remoteJid", c."remoteJid")
+      AND ch."instanceId" = c."instanceId"
+      WHERE c."instanceId" = ${this.instanceId}
+        ${remoteJid ? Prisma.sql`AND c."remoteJid" = ${remoteJid}` : Prisma.sql``}
+      ORDER BY lm."lastMessageMessageTimestamp" DESC NULLS LAST
+      ${limitSql}
+      ${offsetSql};
+    `;
+
+    // --- total (mesma seleção, sem LIMIT/OFFSET) ---
+    const totalRows = await this.prismaRepository.$queryRaw<Array<{ total: number }>>`
+      WITH last_msg AS (
+        SELECT DISTINCT ON (m."key"->>'remoteJid')
+          m."key"->>'remoteJid'    AS "remoteJid",
+          m."messageTimestamp"     AS "lastMessageMessageTimestamp"
+        FROM "Message" m
+        WHERE m."instanceId" = ${this.instanceId}
+          ${remoteJid ? Prisma.sql`AND m."key"->>'remoteJid' = ${remoteJid}` : Prisma.sql``}
+          ${tsFilter}
+        ORDER BY m."key"->>'remoteJid', m."messageTimestamp" DESC
+      )
+      SELECT COUNT(*)::int AS total
+      FROM "Contact" c
+      ${hasTsFilter
+        ? Prisma.sql`INNER JOIN last_msg lm ON lm."remoteJid" = c."remoteJid"`
+        : Prisma.sql`LEFT JOIN  last_msg lm ON lm."remoteJid" = c."remoteJid"`}
+      WHERE c."instanceId" = ${this.instanceId}
+        ${remoteJid ? Prisma.sql`AND c."remoteJid" = ${remoteJid}` : Prisma.sql``};
+    `;
+
+    const total = totalRows?.[0]?.total ?? 0;
+
+    // --- mapeamento DTO ---
+    const items = (rows ?? []).map(r => {
+      const lastMessage = r.lastMessageId
+        ? {
+            id: r.lastMessageId,
+            key: r.lastMessageKey,
+            pushName: r.lastMessagePushName ?? undefined,
+            participant: r.lastMessageParticipant ?? undefined,
+            messageType: r.lastMessageMessageType ?? undefined,
+            message: r.lastMessageMessage ?? undefined,
+            contextInfo: r.lastMessageContextInfo ?? undefined,
+            source: r.lastMessageSource ?? undefined,
+            messageTimestamp: r.lastMessageMessageTimestamp ?? undefined,
+            instanceId: r.lastMessageInstanceId ?? undefined,
+            sessionId: r.lastMessageSessionId ?? undefined,
+            status: r.lastMessageStatus ?? undefined,
+          }
+        : undefined;
+
+      return {
+        // body principal
+        remoteJid: r.remoteJid,
+        pushName: r.pushName ?? undefined,
+        isGroup: r.isGroup,
+
+        // demais campos
+        id: r.contactId ?? null,
+        profilePicUrl: r.profilePicUrl ?? undefined,
+        updatedAt: r.updatedAt ?? undefined,
+        lastMessage: lastMessage ? this.cleanMessageData(lastMessage) : undefined,
+        unreadCount: 0,
+        isSaved: !!r.contactId,
+      };
+    });
+
+    return {
+      items,
+      total,
+      take,
+      skip,
+      hasMore: skip + take < total,
+    };
+  }
+
 }

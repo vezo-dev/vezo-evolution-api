@@ -109,4 +109,8 @@ export class ChatController {
   public async blockUser({ instanceName }: InstanceDto, data: BlockUserDto) {
     return await this.waMonitor.waInstances[instanceName].blockUser(data);
   }
+
+    public async fetchVezoChats({ instanceName }: InstanceDto, query: Query<Contact>) {
+    return await this.waMonitor.waInstances[instanceName].fetchVezoChats(query);
+  }
 }
