@@ -271,7 +271,17 @@ export class ChatRouter extends RouterBroker {
         });
 
         return res.status(HttpStatus.CREATED).json(response);
-      });
+      })      
+      .post(this.routerPath('findVezoChats'), ...guards, async (req, res) => {
+        const response = await this.dataValidate<Query<Contact>>({
+          request: req,
+          schema: contactValidateSchema,
+          ClassRef: Query<Contact>,
+          execute: (instance, data) => chatController.fetchVezoChats(instance, data),
+        });
+
+        return res.status(HttpStatus.OK).json(response);
+      })
   }
 
   public readonly router: Router = Router();
