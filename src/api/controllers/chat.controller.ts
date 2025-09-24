@@ -62,6 +62,10 @@ export class ChatController {
     return await this.waMonitor.waInstances[instanceName].fetchMessages(query);
   }
 
+  public async fetchVezoMessages({ instanceName }: InstanceDto, query: Query<Message>) {
+    return await this.waMonitor.waInstances[instanceName].fetchVezoMessages(query);
+  }
+
   public async fetchStatusMessage({ instanceName }: InstanceDto, query: Query<MessageUpdate>) {
     return await this.waMonitor.waInstances[instanceName].fetchStatusMessage(query);
   }
