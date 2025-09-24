@@ -676,6 +676,185 @@ export class ChannelStartupService {
     };
   }
 
+  public async fetchVezoMessages(query: Query<Message>) {
+    // -------- Paginação: page (zero-based) + limit
+    const page = Number.isInteger(query?.page) ? Math.max(0, Number(query.page)) : 0;
+    const limit = Math.max(1, Number(query?.limit ?? 50) || 50); // tamanho da página
+    const skip = page * limit;
+
+    // -------- Filtros por key.*
+    const keyFilters = (query?.where as any)?.key as {
+      id?: string;
+      fromMe?: boolean;
+      remoteJid?: string;
+      participant?: string; // usar singular
+    } ?? {};
+
+    // -------- Filtro por timestamp (segundos UNIX) — aceita gte e/ou lte
+    const timestampFilter: Record<string, any> = {};
+    if ((query?.where as any)?.messageTimestamp) {
+      const mt = (query.where as any).messageTimestamp;
+      const gte = mt['gte'];
+      const lte = mt['lte'];
+      if (gte || lte) {
+        timestampFilter['messageTimestamp'] = {
+          ...(gte ? { gte: Math.floor(new Date(gte).getTime() / 1000) } : {}),
+          ...(lte ? { lte: Math.floor(new Date(lte).getTime() / 1000) } : {}),
+        };
+      }
+    }
+
+    // -------- Regra: nunca paginar/contar reactionMessage
+    const messageTypeWhere =
+      (query?.where as any)?.messageType && (query.where as any).messageType !== 'reactionMessage'
+        ? { messageType: (query.where as any).messageType }
+        : { messageType: { not: 'reactionMessage' } };
+
+    // -------- Where base (usado em count e findMany)
+    const baseWhere: any = {
+      instanceId: this.instanceId,
+      id: (query?.where as any)?.id,
+      source: (query?.where as any)?.source,
+      ...messageTypeWhere,
+      ...timestampFilter,
+      AND: [
+        keyFilters?.id ? { key: { path: ['id'], equals: keyFilters.id } } : {},
+        typeof keyFilters?.fromMe === 'boolean'
+          ? { key: { path: ['fromMe'], equals: keyFilters.fromMe } }
+          : {},
+        keyFilters?.remoteJid
+          ? { key: { path: ['remoteJid'], equals: keyFilters.remoteJid } }
+          : {},
+        keyFilters?.participant
+          ? { key: { path: ['participant'], equals: keyFilters.participant } }
+          : {},
+      ],
+    };
+
+    // -------- Total de ELEMENTOS (mensagens base, sem reações)
+    const total = await this.prismaRepository.message.count({ where: baseWhere });
+
+    // -------- Página corrente de ELEMENTOS (page/limit)
+    const messages = await this.prismaRepository.message.findMany({
+      where: baseWhere,
+      orderBy: [
+        { messageTimestamp: 'desc' },
+        { id: 'desc' }, // tie-breaker estável para timestamps iguais
+      ],
+      skip,
+      take: limit,
+      select: {
+        id: true,
+        key: true,
+        pushName: true,
+        messageType: true,
+        message: true,
+        messageTimestamp: true,
+        instanceId: true,
+        source: true,
+        contextInfo: true,
+        MessageUpdate: { select: { status: true } },
+      },
+    });
+
+    // -------- Coletar alvos (key.id + key.remoteJid) das mensagens da página
+    type ParentTarget = { id: string; remoteJid?: string };
+    const parentTargets: ParentTarget[] = messages
+      .map((m) => {
+        const k = m.key as any;
+        const id = k?.id ? String(k.id) : undefined;
+        if (!id) return null;
+        return { id, remoteJid: k?.remoteJid ? String(k.remoteJid) : undefined };
+      })
+      .filter(Boolean) as ParentTarget[];
+
+    // -------- Buscar reações direcionadas aos alvos da página
+    let reactionsByTarget = new Map<string, any[]>();
+
+    if (parentTargets.length > 0) {
+      const reactionWhereOR: any[] = [];
+      for (const t of parentTargets) {
+        const andClause: any[] = [
+          { message: { path: ['reactionMessage', 'key', 'id'], equals: t.id } },
+        ];
+        if (t.remoteJid) {
+          andClause.push({
+            message: {
+              path: ['reactionMessage', 'key', 'remoteJid'],
+              equals: t.remoteJid,
+            },
+          });
+        }
+        reactionWhereOR.push({ AND: andClause });
+      }
+
+      const reactions = await this.prismaRepository.message.findMany({
+        where: {
+          instanceId: this.instanceId,
+          messageType: 'reactionMessage',
+          ...(reactionWhereOR.length ? { OR: reactionWhereOR } : {}),
+        },
+        select: {
+          id: true,
+          key: true,
+          message: true,
+          messageTimestamp: true,
+          pushName: true,
+          source: true,
+          instanceId: true,
+          contextInfo: true,
+        },
+      });
+
+      // Indexar por `${remoteJid}::${id}` do ALVO
+      reactionsByTarget = reactions.reduce((map, rx) => {
+        const msg = rx.message as any;
+        const tgt = msg?.reactionMessage?.key;
+        const mapKey = `${tgt?.remoteJid ?? ''}::${tgt?.id ?? ''}`;
+
+        const data = {
+          id: rx.id,
+          emoji: msg?.reactionMessage?.text ?? null,
+          fromMe: (rx.key as any)?.fromMe ?? null,
+          by: (rx.key as any)?.participant ?? null,
+          remoteJid: tgt?.remoteJid ?? (rx.key as any)?.remoteJid ?? null,
+          senderTimestampMs: msg?.reactionMessage?.senderTimestampMs ?? null,
+          messageTimestamp: rx.messageTimestamp,
+          pushName: rx.pushName ?? null,
+          source: rx.source,
+          contextInfo: rx.contextInfo ?? null,
+        };
+
+        const arr = map.get(mapKey) ?? [];
+        arr.push(data);
+        map.set(mapKey, arr);
+        return map;
+      }, new Map<string, any[]>());
+    }
+
+    // -------- Anexar reactions às mensagens paginadas (sem afetar total)
+    const recordsWithReactions = messages.map((m) => {
+      const k = m.key as any;
+      const mapKey = `${k?.remoteJid ?? ''}::${k?.id ?? ''}`;
+      const reactions = reactionsByTarget.get(mapKey) ?? [];
+      return { ...m, reactions };
+    });
+
+    // -------- Totais/páginas (zero-based)
+    const pages = total === 0 ? 0 : Math.ceil(total / limit);
+    const currentPage = page; // zero-based
+
+    return {
+      messages: {
+        total,           // total de mensagens base (sem reações)
+        pages,           // total de páginas com o limit informado
+        currentPage,     // página atual (zero-based)
+        limit,           // eco do limit recebido
+        records: recordsWithReactions,
+      },
+    };
+  }
+
   public async fetchStatusMessage(query: any) {
     if (!query?.offset) {
       query.offset = 50;
@@ -1004,5 +1183,4 @@ export class ChannelStartupService {
       hasMore: skip + take < total,
     };
   }
-
 }

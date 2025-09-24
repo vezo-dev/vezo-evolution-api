@@ -171,6 +171,16 @@ export class ChatRouter extends RouterBroker {
 
         return res.status(HttpStatus.OK).json(response);
       })
+      .post(this.routerPath('findVezoMessages'), ...guards, async (req, res) => {
+        const response = await this.dataValidate<Query<Message>>({
+          request: req,
+          schema: messageValidateSchema,
+          ClassRef: Query<Message>,
+          execute: (instance, data) => chatController.fetchVezoMessages(instance, data),
+        });
+
+        return res.status(HttpStatus.OK).json(response);
+      })
       .post(this.routerPath('findStatusMessage'), ...guards, async (req, res) => {
         const response = await this.dataValidate<Query<MessageUpdate>>({
           request: req,
