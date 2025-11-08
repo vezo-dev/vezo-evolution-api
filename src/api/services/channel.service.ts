@@ -9,7 +9,7 @@ import { TypebotService } from '@api/integrations/chatbot/typebot/services/typeb
 import { PrismaRepository, Query } from '@api/repository/repository.service';
 import { eventManager, waMonitor } from '@api/server.module';
 import { Events, wa } from '@api/types/wa.types';
-import { Auth, Chatwoot, ConfigService, HttpServer } from '@config/env.config';
+import { Auth, Chatwoot, ConfigService, HttpServer, Proxy } from '@config/env.config';
 import { Logger } from '@config/logger.config';
 import { NotFoundException } from '@exceptions';
 import { Contact, Message, Prisma } from '@prisma/client';
@@ -364,13 +364,14 @@ export class ChannelStartupService {
   public async loadProxy() {
     this.localProxy.enabled = false;
 
-    if (process.env.PROXY_HOST) {
+    const proxyConfig = this.configService.get<Proxy>('PROXY');
+    if (proxyConfig.HOST) {
       this.localProxy.enabled = true;
-      this.localProxy.host = process.env.PROXY_HOST;
-      this.localProxy.port = process.env.PROXY_PORT || '80';
-      this.localProxy.protocol = process.env.PROXY_PROTOCOL || 'http';
-      this.localProxy.username = process.env.PROXY_USERNAME;
-      this.localProxy.password = process.env.PROXY_PASSWORD;
+      this.localProxy.host = proxyConfig.HOST;
+      this.localProxy.port = proxyConfig.PORT || '80';
+      this.localProxy.protocol = proxyConfig.PROTOCOL || 'http';
+      this.localProxy.username = proxyConfig.USERNAME;
+      this.localProxy.password = proxyConfig.PASSWORD;
     }
 
     const data = await this.prismaRepository.proxy.findUnique({
@@ -430,7 +431,7 @@ export class ChannelStartupService {
     return data;
   }
 
-  public async sendDataWebhook<T = any>(event: Events, data: T, local = true, integration?: string[]) {
+  public async sendDataWebhook<T extends object = any>(event: Events, data: T, local = true, integration?: string[]) {
     const serverUrl = this.configService.get<HttpServer>('SERVER').URL;
     const tzoffset = new Date().getTimezoneOffset() * 60000; //offset in milliseconds
     const localISOTime = new Date(Date.now() - tzoffset).toISOString();
@@ -875,6 +876,16 @@ export class ChannelStartupService {
     });
   }
 
+  public async findChatByRemoteJid(remoteJid: string) {
+    if (!remoteJid) return null;
+    return await this.prismaRepository.chat.findFirst({
+      where: {
+        instanceId: this.instanceId,
+        remoteJid: remoteJid,
+      },
+    });
+  }
+
   public async fetchChats(query: any) {
     const remoteJid = query?.where?.remoteJid
       ? query?.where?.remoteJid.includes('@')
@@ -917,22 +928,23 @@ export class ChannelStartupService {
           "Chat"."name" as "pushName",
           "Chat"."createdAt" as "windowStart",
           "Chat"."createdAt" + INTERVAL '24 hours' as "windowExpires",
+          "Chat"."unreadMessages" as "unreadMessages",
           CASE WHEN "Chat"."createdAt" + INTERVAL '24 hours' > NOW() THEN true ELSE false END as "windowActive",
-          "Message"."id" AS lastMessageId,
-          "Message"."key" AS lastMessage_key,
+          "Message"."id" AS "lastMessageId",
+          "Message"."key" AS "lastMessage_key",
           CASE
             WHEN "Message"."key"->>'fromMe' = 'true' THEN 'Você'
             ELSE "Message"."pushName"
-          END AS lastMessagePushName,
-          "Message"."participant" AS lastMessageParticipant,
-          "Message"."messageType" AS lastMessageMessageType,
-          "Message"."message" AS lastMessageMessage,
-          "Message"."contextInfo" AS lastMessageContextInfo,
-          "Message"."source" AS lastMessageSource,
-          "Message"."messageTimestamp" AS lastMessageMessageTimestamp,
-          "Message"."instanceId" AS lastMessageInstanceId,
-          "Message"."sessionId" AS lastMessageSessionId,
-          "Message"."status" AS lastMessageStatus
+          END AS "lastMessagePushName",
+          "Message"."participant" AS "lastMessageParticipant",
+          "Message"."messageType" AS "lastMessageMessageType",
+          "Message"."message" AS "lastMessageMessage",
+          "Message"."contextInfo" AS "lastMessageContextInfo",
+          "Message"."source" AS "lastMessageSource",
+          "Message"."messageTimestamp" AS "lastMessageMessageTimestamp",
+          "Message"."instanceId" AS "lastMessageInstanceId",
+          "Message"."sessionId" AS "lastMessageSessionId",
+          "Message"."status" AS "lastMessageStatus"
         FROM "Message"
         LEFT JOIN "Contact" ON "Contact"."remoteJid" = "Message"."key"->>'remoteJid' AND "Contact"."instanceId" = "Message"."instanceId"
         LEFT JOIN "Chat" ON "Chat"."remoteJid" = "Message"."key"->>'remoteJid' AND "Chat"."instanceId" = "Message"."instanceId"
@@ -949,43 +961,37 @@ export class ChannelStartupService {
 
     if (results && isArray(results) && results.length > 0) {
       const mappedResults = results.map((contact) => {
-        const lastMessage = contact.lastmessageid
+        const lastMessage = contact.lastMessageId
           ? {
-              id: contact.lastmessageid,
-              key: contact.lastmessage_key,
-              pushName: contact.lastmessagepushname,
-              participant: contact.lastmessageparticipant,
-              messageType: contact.lastmessagemessagetype,
-              message: contact.lastmessagemessage,
-              contextInfo: contact.lastmessagecontextinfo,
-              source: contact.lastmessagesource,
-              messageTimestamp: contact.lastmessagemessagetimestamp,
-              instanceId: contact.lastmessageinstanceid,
-              sessionId: contact.lastmessagesessionid,
-              status: contact.lastmessagestatus,
+              id: contact.lastMessageId,
+              key: contact.lastMessage_key,
+              pushName: contact.lastMessagePushName,
+              participant: contact.lastMessageParticipant,
+              messageType: contact.lastMessageMessageType,
+              message: contact.lastMessageMessage,
+              contextInfo: contact.lastMessageContextInfo,
+              source: contact.lastMessageSource,
+              messageTimestamp: contact.lastMessageMessageTimestamp,
+              instanceId: contact.lastMessageInstanceId,
+              sessionId: contact.lastMessageSessionId,
+              status: contact.lastMessageStatus,
             }
           : undefined;
 
         return {
-          id: contact.contactid || null,
-          remoteJid: contact.remotejid,
-          pushName: contact.pushname,
-          profilePicUrl: contact.profilepicurl,
-          updatedAt: contact.updatedat,
-          windowStart: contact.windowstart,
-          windowExpires: contact.windowexpires,
-          windowActive: contact.windowactive,
+          id: contact.contactId || null,
+          remoteJid: contact.remoteJid,
+          pushName: contact.pushName,
+          profilePicUrl: contact.profilePicUrl,
+          updatedAt: contact.updatedAt,
+          windowStart: contact.windowStart,
+          windowExpires: contact.windowExpires,
+          windowActive: contact.windowActive,
           lastMessage: lastMessage ? this.cleanMessageData(lastMessage) : undefined,
-          unreadCount: 0,
-          isSaved: !!contact.contactid,
+          unreadCount: contact.unreadMessages,
+          isSaved: !!contact.contactId,
         };
       });
-
-      if (query?.take && query?.skip) {
-        const skip = query.skip || 0;
-        const take = query.take || 20;
-        return mappedResults.slice(skip, skip + take);
-      }
 
       return mappedResults;
     }
@@ -993,194 +999,27 @@ export class ChannelStartupService {
     return [];
   }
 
-  public async fetchVezoChats(query: {
-    where?: {
-      remoteJid?: string;
-      messageTimestamp?: { gte?: string | Date; lte?: string | Date };
-    };
-    take?: number;
-    skip?: number;
-  }) {
-    // --- filtros e paginação (sem non-null assertion) ---
-    const remoteJid =
-      query?.where?.remoteJid
-        ? (query.where.remoteJid.includes('@') ? query.where.remoteJid : createJid(query.where.remoteJid))
-        : null;
+  public hasValidMediaContent(message: any): boolean {
+    if (!message?.message) return false;
 
-    const gte =
-      query?.where?.messageTimestamp?.gte != null
-        ? Math.floor(new Date(query.where!.messageTimestamp!.gte as any).getTime() / 1000)
-        : undefined;
+    const msg = message.message;
 
-    const lte =
-      query?.where?.messageTimestamp?.lte != null
-        ? Math.floor(new Date(query.where!.messageTimestamp!.lte as any).getTime() / 1000)
-        : undefined;
+    // Se só tem messageContextInfo, não é mídia válida
+    if (Object.keys(msg).length === 1 && Object.prototype.hasOwnProperty.call(msg, 'messageContextInfo')) {
+      return false;
+    }
 
-    const hasTsFilter = gte != null && lte != null;
+    // Verifica se tem pelo menos um tipo de mídia válido
+    const mediaTypes = [
+      'imageMessage',
+      'videoMessage',
+      'stickerMessage',
+      'documentMessage',
+      'documentWithCaptionMessage',
+      'ptvMessage',
+      'audioMessage',
+    ];
 
-    const tsFilter = hasTsFilter
-      ? Prisma.sql`AND m."messageTimestamp" >= ${gte!} AND m."messageTimestamp" <= ${lte!}`
-      : Prisma.sql``;
-
-    const take = Number.isFinite(query?.take) ? Number(query!.take) : 20;
-    const skip = Number.isFinite(query?.skip) ? Number(query!.skip) : 0;
-
-    const limitSql = Prisma.sql`LIMIT ${take}`;
-    const offsetSql = Prisma.sql`OFFSET ${skip}`;
-
-    // --- página de dados ---
-    const rows = await this.prismaRepository.$queryRaw<Array<{
-      contactId: string | null;
-      remoteJid: string;
-      pushName: string | null;
-      profilePicUrl: string | null;
-      updatedAt: Date | null;
-      isGroup: boolean;
-
-      lastMessageId: string | null;
-      lastMessageKey: Prisma.JsonValue | null;
-      lastMessagePushName: string | null;
-      lastMessageParticipant: string | null;
-      lastMessageMessageType: string | null;
-      lastMessageMessage: Prisma.JsonValue | null;
-      lastMessageContextInfo: Prisma.JsonValue | null;
-      lastMessageSource: string | null;
-      lastMessageMessageTimestamp: number | null;
-      lastMessageInstanceId: string | null;
-      lastMessageSessionId: string | null;
-      lastMessageStatus: string | null;
-    }>>`
-      WITH last_msg AS (
-        SELECT DISTINCT ON (m."key"->>'remoteJid')
-          m."key"->>'remoteJid'                    AS "remoteJid",
-          m."id"                                   AS "lastMessageId",
-          m."key"                                  AS "lastMessageKey",
-          CASE WHEN m."key"->>'fromMe' = 'true'
-              THEN 'Você' ELSE m."pushName" END   AS "lastMessagePushName",
-          m."participant"                          AS "lastMessageParticipant",
-          m."messageType"                          AS "lastMessageMessageType",
-          m."message"                              AS "lastMessageMessage",
-          m."contextInfo"                          AS "lastMessageContextInfo",
-          m."source"                               AS "lastMessageSource",
-          m."messageTimestamp"                     AS "lastMessageMessageTimestamp",
-          m."instanceId"                           AS "lastMessageInstanceId",
-          m."sessionId"                            AS "lastMessageSessionId",
-          m."status"                               AS "lastMessageStatus"
-        FROM "Message" m
-        WHERE m."instanceId" = ${this.instanceId}
-          ${remoteJid ? Prisma.sql`AND m."key"->>'remoteJid' = ${remoteJid}` : Prisma.sql``}
-          ${tsFilter}
-        ORDER BY m."key"->>'remoteJid', m."messageTimestamp" DESC
-      )
-      SELECT
-        c."id"                                     AS "contactId",
-        COALESCE(lm."remoteJid", c."remoteJid")    AS "remoteJid",
-        CASE
-          WHEN COALESCE(lm."remoteJid", c."remoteJid") LIKE '%@g.us'
-            THEN COALESCE(ch."name", c."pushName")
-          ELSE COALESCE(c."pushName", lm."lastMessagePushName")
-        END                                         AS "pushName",
-        c."profilePicUrl"                           AS "profilePicUrl",
-        COALESCE(
-          CASE WHEN lm."lastMessageMessageTimestamp" IS NOT NULL
-              THEN to_timestamp(lm."lastMessageMessageTimestamp"::double precision)
-              ELSE NULL
-          END,
-          c."updatedAt"
-        )                                           AS "updatedAt",
-        (COALESCE(lm."remoteJid", c."remoteJid") LIKE '%@g.us') AS "isGroup",
-
-        lm."lastMessageId",
-        lm."lastMessageKey",
-        lm."lastMessagePushName",
-        lm."lastMessageParticipant",
-        lm."lastMessageMessageType",
-        lm."lastMessageMessage",
-        lm."lastMessageContextInfo",
-        lm."lastMessageSource",
-        lm."lastMessageMessageTimestamp",
-        lm."lastMessageInstanceId",
-        lm."lastMessageSessionId",
-        lm."lastMessageStatus"
-      FROM "Contact" c
-      ${hasTsFilter
-        ? Prisma.sql`INNER JOIN last_msg lm ON lm."remoteJid" = c."remoteJid"`
-        : Prisma.sql`LEFT JOIN  last_msg lm ON lm."remoteJid" = c."remoteJid"`}
-      LEFT JOIN "Chat" ch
-        ON ch."remoteJid" = COALESCE(lm."remoteJid", c."remoteJid")
-      AND ch."instanceId" = c."instanceId"
-      WHERE c."instanceId" = ${this.instanceId}
-        ${remoteJid ? Prisma.sql`AND c."remoteJid" = ${remoteJid}` : Prisma.sql``}
-      ORDER BY lm."lastMessageMessageTimestamp" DESC NULLS LAST
-      ${limitSql}
-      ${offsetSql};
-    `;
-
-    // --- total (mesma seleção, sem LIMIT/OFFSET) ---
-    const totalRows = await this.prismaRepository.$queryRaw<Array<{ total: number }>>`
-      WITH last_msg AS (
-        SELECT DISTINCT ON (m."key"->>'remoteJid')
-          m."key"->>'remoteJid'    AS "remoteJid",
-          m."messageTimestamp"     AS "lastMessageMessageTimestamp"
-        FROM "Message" m
-        WHERE m."instanceId" = ${this.instanceId}
-          ${remoteJid ? Prisma.sql`AND m."key"->>'remoteJid' = ${remoteJid}` : Prisma.sql``}
-          ${tsFilter}
-        ORDER BY m."key"->>'remoteJid', m."messageTimestamp" DESC
-      )
-      SELECT COUNT(*)::int AS total
-      FROM "Contact" c
-      ${hasTsFilter
-        ? Prisma.sql`INNER JOIN last_msg lm ON lm."remoteJid" = c."remoteJid"`
-        : Prisma.sql`LEFT JOIN  last_msg lm ON lm."remoteJid" = c."remoteJid"`}
-      WHERE c."instanceId" = ${this.instanceId}
-        ${remoteJid ? Prisma.sql`AND c."remoteJid" = ${remoteJid}` : Prisma.sql``};
-    `;
-
-    const total = totalRows?.[0]?.total ?? 0;
-
-    // --- mapeamento DTO ---
-    const items = (rows ?? []).map(r => {
-      const lastMessage = r.lastMessageId
-        ? {
-            id: r.lastMessageId,
-            key: r.lastMessageKey,
-            pushName: r.lastMessagePushName ?? undefined,
-            participant: r.lastMessageParticipant ?? undefined,
-            messageType: r.lastMessageMessageType ?? undefined,
-            message: r.lastMessageMessage ?? undefined,
-            contextInfo: r.lastMessageContextInfo ?? undefined,
-            source: r.lastMessageSource ?? undefined,
-            messageTimestamp: r.lastMessageMessageTimestamp ?? undefined,
-            instanceId: r.lastMessageInstanceId ?? undefined,
-            sessionId: r.lastMessageSessionId ?? undefined,
-            status: r.lastMessageStatus ?? undefined,
-          }
-        : undefined;
-
-      return {
-        // body principal
-        remoteJid: r.remoteJid,
-        pushName: r.pushName ?? undefined,
-        isGroup: r.isGroup,
-
-        // demais campos
-        id: r.contactId ?? null,
-        profilePicUrl: r.profilePicUrl ?? undefined,
-        updatedAt: r.updatedAt ?? undefined,
-        lastMessage: lastMessage ? this.cleanMessageData(lastMessage) : undefined,
-        unreadCount: 0,
-        isSaved: !!r.contactId,
-      };
-    });
-
-    return {
-      items,
-      total,
-      take,
-      skip,
-      hasMore: skip + take < total,
-    };
+    return mediaTypes.some((type) => msg[type] && Object.keys(msg[type]).length > 0);
   }
 }

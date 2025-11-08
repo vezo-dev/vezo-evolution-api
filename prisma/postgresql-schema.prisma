@@ -88,6 +88,7 @@ model Instance {
   Rabbitmq                Rabbitmq?
   Nats                    Nats?
   Sqs                     Sqs?
+  Kafka                   Kafka?
   Websocket               Websocket?
   Typebot                 Typebot[]
   Session                 Session?
@@ -312,6 +313,16 @@ model Sqs {
   instanceId String    @unique
 }
 
+model Kafka {
+  id         String    @id @default(cuid())
+  enabled    Boolean   @default(false) @db.Boolean
+  events     Json      @db.JsonB
+  createdAt  DateTime? @default(now()) @db.Timestamp
+  updatedAt  DateTime  @updatedAt @db.Timestamp
+  Instance   Instance  @relation(fields: [instanceId], references: [id], onDelete: Cascade)
+  instanceId String    @unique
+}
+
 model Websocket {
   id         String    @id @default(cuid())
   enabled    Boolean   @default(false) @db.Boolean
@@ -376,8 +387,8 @@ model TypebotSetting {
   debounceTime      Int?      @db.Integer
   typebotIdFallback String?   @db.VarChar(100)
   ignoreJids        Json?
-  splitMessages     Boolean?         @default(false) @db.Boolean
-  timePerChar       Int?             @default(50) @db.Integer
+  splitMessages     Boolean?  @default(false) @db.Boolean
+  timePerChar       Int?      @default(50) @db.Integer
   createdAt         DateTime? @default(now()) @db.Timestamp
   updatedAt         DateTime  @updatedAt @db.Timestamp
   Fallback          Typebot?  @relation(fields: [typebotIdFallback], references: [id])
