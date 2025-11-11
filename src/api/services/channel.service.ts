@@ -678,183 +678,194 @@ export class ChannelStartupService {
   }
 
   public async fetchVezoMessages(query: Query<Message>) {
-    // -------- Paginação: page (zero-based) + limit
-    const page = Number.isInteger(query?.page) ? Math.max(0, Number(query.page)) : 0;
-    const limit = Math.max(1, Number(query?.limit ?? 50) || 50); // tamanho da página
-    const skip = page * limit;
+  // -------- Paginação
+  const page = Number.isInteger(query?.page) ? Math.max(0, Number(query.page)) : 0;
+  const limit = Math.max(1, Number(query?.limit ?? 50) || 50);
+  const skip = page * limit;
 
-    // -------- Filtros por key.*
-    const keyFilters = (query?.where as any)?.key as {
-      id?: string;
-      fromMe?: boolean;
-      remoteJid?: string;
-      participant?: string; // usar singular
-    } ?? {};
+  // -------- Filtros
+  const keyFilters = (query?.where as any)?.key ?? {};
+  const timestampFilter: Prisma.Sql[] = [];
 
-    // -------- Filtro por timestamp (segundos UNIX) — aceita gte e/ou lte
-    const timestampFilter: Record<string, any> = {};
-    if ((query?.where as any)?.messageTimestamp) {
-      const mt = (query.where as any).messageTimestamp;
-      const gte = mt['gte'];
-      const lte = mt['lte'];
-      if (gte || lte) {
-        timestampFilter['messageTimestamp'] = {
-          ...(gte ? { gte: Math.floor(new Date(gte).getTime() / 1000) } : {}),
-          ...(lte ? { lte: Math.floor(new Date(lte).getTime() / 1000) } : {}),
-        };
-      }
-    }
-
-    // -------- Regra: nunca paginar/contar reactionMessage
-    const messageTypeWhere =
-      (query?.where as any)?.messageType && (query.where as any).messageType !== 'reactionMessage'
-        ? { messageType: (query.where as any).messageType }
-        : { messageType: { not: 'reactionMessage' } };
-
-    // -------- Where base (usado em count e findMany)
-    const baseWhere: any = {
-      instanceId: this.instanceId,
-      id: (query?.where as any)?.id,
-      source: (query?.where as any)?.source,
-      ...messageTypeWhere,
-      ...timestampFilter,
-      AND: [
-        keyFilters?.id ? { key: { path: ['id'], equals: keyFilters.id } } : {},
-        typeof keyFilters?.fromMe === 'boolean'
-          ? { key: { path: ['fromMe'], equals: keyFilters.fromMe } }
-          : {},
-        keyFilters?.remoteJid
-          ? { key: { path: ['remoteJid'], equals: keyFilters.remoteJid } }
-          : {},
-        keyFilters?.participant
-          ? { key: { path: ['participant'], equals: keyFilters.participant } }
-          : {},
-      ],
-    };
-
-    // -------- Total de ELEMENTOS (mensagens base, sem reações)
-    const total = await this.prismaRepository.message.count({ where: baseWhere });
-
-    // -------- Página corrente de ELEMENTOS (page/limit)
-    const messages = await this.prismaRepository.message.findMany({
-      where: baseWhere,
-      orderBy: [
-        { messageTimestamp: 'desc' },
-        { id: 'desc' }, // tie-breaker estável para timestamps iguais
-      ],
-      skip,
-      take: limit,
-      select: {
-        id: true,
-        key: true,
-        pushName: true,
-        messageType: true,
-        message: true,
-        messageTimestamp: true,
-        instanceId: true,
-        source: true,
-        contextInfo: true,
-        MessageUpdate: { select: { status: true } },
-      },
-    });
-
-    // -------- Coletar alvos (key.id + key.remoteJid) das mensagens da página
-    type ParentTarget = { id: string; remoteJid?: string };
-    const parentTargets: ParentTarget[] = messages
-      .map((m) => {
-        const k = m.key as any;
-        const id = k?.id ? String(k.id) : undefined;
-        if (!id) return null;
-        return { id, remoteJid: k?.remoteJid ? String(k.remoteJid) : undefined };
-      })
-      .filter(Boolean) as ParentTarget[];
-
-    // -------- Buscar reações direcionadas aos alvos da página
-    let reactionsByTarget = new Map<string, any[]>();
-
-    if (parentTargets.length > 0) {
-      const reactionWhereOR: any[] = [];
-      for (const t of parentTargets) {
-        const andClause: any[] = [
-          { message: { path: ['reactionMessage', 'key', 'id'], equals: t.id } },
-        ];
-        if (t.remoteJid) {
-          andClause.push({
-            message: {
-              path: ['reactionMessage', 'key', 'remoteJid'],
-              equals: t.remoteJid,
-            },
-          });
-        }
-        reactionWhereOR.push({ AND: andClause });
-      }
-
-      const reactions = await this.prismaRepository.message.findMany({
-        where: {
-          instanceId: this.instanceId,
-          messageType: 'reactionMessage',
-          ...(reactionWhereOR.length ? { OR: reactionWhereOR } : {}),
-        },
-        select: {
-          id: true,
-          key: true,
-          message: true,
-          messageTimestamp: true,
-          pushName: true,
-          source: true,
-          instanceId: true,
-          contextInfo: true,
-        },
-      });
-
-      // Indexar por `${remoteJid}::${id}` do ALVO
-      reactionsByTarget = reactions.reduce((map, rx) => {
-        const msg = rx.message as any;
-        const tgt = msg?.reactionMessage?.key;
-        const mapKey = `${tgt?.remoteJid ?? ''}::${tgt?.id ?? ''}`;
-
-        const data = {
-          id: rx.id,
-          emoji: msg?.reactionMessage?.text ?? null,
-          fromMe: (rx.key as any)?.fromMe ?? null,
-          by: (rx.key as any)?.participant ?? null,
-          remoteJid: tgt?.remoteJid ?? (rx.key as any)?.remoteJid ?? null,
-          senderTimestampMs: msg?.reactionMessage?.senderTimestampMs ?? null,
-          messageTimestamp: rx.messageTimestamp,
-          pushName: rx.pushName ?? null,
-          source: rx.source,
-          contextInfo: rx.contextInfo ?? null,
-        };
-
-        const arr = map.get(mapKey) ?? [];
-        arr.push(data);
-        map.set(mapKey, arr);
-        return map;
-      }, new Map<string, any[]>());
-    }
-
-    // -------- Anexar reactions às mensagens paginadas (sem afetar total)
-    const recordsWithReactions = messages.map((m) => {
-      const k = m.key as any;
-      const mapKey = `${k?.remoteJid ?? ''}::${k?.id ?? ''}`;
-      const reactions = reactionsByTarget.get(mapKey) ?? [];
-      return { ...m, reactions };
-    });
-
-    // -------- Totais/páginas (zero-based)
-    const pages = total === 0 ? 0 : Math.ceil(total / limit);
-    const currentPage = page; // zero-based
-
-    return {
-      messages: {
-        total,           // total de mensagens base (sem reações)
-        pages,           // total de páginas com o limit informado
-        currentPage,     // página atual (zero-based)
-        limit,           // eco do limit recebido
-        records: recordsWithReactions,
-      },
-    };
+  if ((query?.where as any)?.messageTimestamp) {
+    const mt = (query.where as any).messageTimestamp;
+    if (mt.gte)
+      timestampFilter.push(
+        Prisma.sql`m."messageTimestamp" >= ${Math.floor(new Date(mt.gte).getTime() / 1000)}`
+      );
+    if (mt.lte)
+      timestampFilter.push(
+        Prisma.sql`m."messageTimestamp" <= ${Math.floor(new Date(mt.lte).getTime() / 1000)}`
+      );
   }
+
+  const messageTypeFilter =
+    (query?.where as any)?.messageType && (query.where as any).messageType !== 'reactionMessage'
+      ? Prisma.sql`m."messageType" = ${query.where.messageType}`
+      : Prisma.sql`m."messageType" != 'reactionMessage'`;
+
+  const jsonFilters: Prisma.Sql[] = [];
+  if (keyFilters?.id) jsonFilters.push(Prisma.sql`(m."key"->>'id') = ${keyFilters.id}`);
+  if (typeof keyFilters?.fromMe === 'boolean')
+    jsonFilters.push(Prisma.sql`(m."key"->>'fromMe')::boolean = ${keyFilters.fromMe}`);
+  if (keyFilters?.remoteJid)
+    jsonFilters.push(Prisma.sql`(m."key"->>'remoteJid') = ${keyFilters.remoteJid}`);
+  if (keyFilters?.participant)
+    jsonFilters.push(Prisma.sql`(m."key"->>'participant') = ${keyFilters.participant}`);
+
+  const whereClauses = [
+    Prisma.sql`m."instanceId" = ${this.instanceId}`,
+    messageTypeFilter,
+    ...timestampFilter,
+    ...jsonFilters,
+  ];
+
+  const whereSql = whereClauses.length
+    ? Prisma.sql`WHERE ${Prisma.join(whereClauses, ' AND ')}`
+    : Prisma.sql``;
+
+  // -------- Mensagens deduplicadas
+  const messages = await this.prismaRepository.$queryRaw<Array<any>>`
+    SELECT *
+    FROM (
+      SELECT DISTINCT ON (m."key"->>'id', m."instanceId")
+        m."id",
+        m."key",
+        m."pushName",
+        m."messageType",
+        m."message",
+        m."messageTimestamp",
+        m."instanceId",
+        m."source",
+        m."contextInfo"
+      FROM "Message" m
+      ${whereSql}
+      ORDER BY m."key"->>'id', m."instanceId", m."messageTimestamp" DESC
+    ) AS deduped
+    ORDER BY deduped."messageTimestamp" DESC, deduped."id" DESC
+    LIMIT ${limit}
+    OFFSET ${skip};
+  `;
+
+  // -------- Total de mensagens distintas
+  const totalRows = await this.prismaRepository.$queryRaw<Array<{ total: number }>>`
+    SELECT COUNT(*)::int AS total
+    FROM (
+      SELECT DISTINCT ON (m."key"->>'id', m."instanceId") 1
+      FROM "Message" m
+      ${whereSql}
+      ORDER BY m."key"->>'id', m."instanceId", m."messageTimestamp" DESC
+    ) AS distinct_msgs;
+  `;
+  const total = totalRows?.[0]?.total ?? 0;
+
+  // -------- Alvos das reações
+  type ParentTarget = { id: string; remoteJid?: string };
+  const parentTargets: ParentTarget[] = messages
+    .map((m) => {
+      const k = m.key as any;
+      const id = k?.id ? String(k.id) : undefined;
+      if (!id) return null;
+      return { id, remoteJid: k?.remoteJid ? String(k.remoteJid) : undefined };
+    })
+    .filter(Boolean) as ParentTarget[];
+
+  let reactionsByTarget = new Map<string, any[]>();
+
+  if (parentTargets.length > 0) {
+    const reactionWhereOR: Prisma.Sql[] = parentTargets.map((t) => {
+      const ands: Prisma.Sql[] = [
+        Prisma.sql`(m."message"->'reactionMessage'->'key'->>'id') = ${t.id}`,
+      ];
+      if (t.remoteJid) {
+        ands.push(
+          Prisma.sql`(m."message"->'reactionMessage'->'key'->>'remoteJid') = ${t.remoteJid}`
+        );
+      }
+      return Prisma.sql`(${Prisma.join(ands, ' AND ')})`;
+    });
+
+    const reactionWhere = Prisma.sql`
+      WHERE m."instanceId" = ${this.instanceId}
+        AND m."messageType" = 'reactionMessage'
+        ${reactionWhereOR.length ? Prisma.sql`AND (${Prisma.join(reactionWhereOR, ' OR ')})` : Prisma.sql``}
+    `;
+
+    // -------- Reações deduplicadas (uma por fromMe)
+    const reactions = await this.prismaRepository.$queryRaw<Array<any>>`
+      SELECT *
+      FROM (
+        SELECT DISTINCT ON (
+          m."message"->'reactionMessage'->'key'->>'remoteJid',
+          m."message"->'reactionMessage'->'key'->>'id',
+          (m."key"->>'fromMe')::boolean
+        )
+          m."id",
+          m."key",
+          m."message",
+          m."messageTimestamp",
+          m."pushName",
+          m."source",
+          m."instanceId",
+          m."contextInfo"
+        FROM "Message" m
+        ${reactionWhere}
+        ORDER BY
+          m."message"->'reactionMessage'->'key'->>'remoteJid',
+          m."message"->'reactionMessage'->'key'->>'id',
+          (m."key"->>'fromMe')::boolean,
+          m."messageTimestamp" DESC
+      ) AS distinct_rx
+      ORDER BY distinct_rx."messageTimestamp" DESC;
+    `;
+
+    reactionsByTarget = reactions.reduce((map, rx) => {
+      const msg = rx.message as any;
+      const tgt = msg?.reactionMessage?.key;
+      const mapKey = `${tgt?.remoteJid ?? ''}::${tgt?.id ?? ''}`;
+
+      const data = {
+        id: rx.id,
+        emoji: msg?.reactionMessage?.text ?? null,
+        fromMe: (rx.key as any)?.fromMe ?? null,
+        by: (rx.key as any)?.participant ?? null,
+        remoteJid: tgt?.remoteJid ?? (rx.key as any)?.remoteJid ?? null,
+        senderTimestampMs: msg?.reactionMessage?.senderTimestampMs ?? null,
+        messageTimestamp: rx.messageTimestamp,
+        pushName: rx.pushName ?? null,
+        source: rx.source,
+        contextInfo: rx.contextInfo ?? null,
+      };
+
+      const arr = map.get(mapKey) ?? [];
+      arr.push(data);
+      map.set(mapKey, arr);
+      return map;
+    }, new Map<string, any[]>());
+  }
+
+  // -------- Anexar reações às mensagens
+  const recordsWithReactions = messages.map((m) => {
+    const k = m.key as any;
+    const mapKey = `${k?.remoteJid ?? ''}::${k?.id ?? ''}`;
+    const reactions = reactionsByTarget.get(mapKey) ?? [];
+    return { ...m, reactions };
+  });
+
+  // -------- Paginação
+  const pages = total === 0 ? 0 : Math.ceil(total / limit);
+
+  return {
+    messages: {
+      total,
+      pages,
+      currentPage: page,
+      limit,
+      records: recordsWithReactions,
+    },
+  };
+}
+
 
   public async fetchVezoChats(query: {
     where?: {
@@ -894,12 +905,13 @@ export class ChannelStartupService {
 
     // --- página de dados ---
     const rows = await this.prismaRepository.$queryRaw<Array<{
-      contactId: string | null;
+      chatId: string | null;
       remoteJid: string;
       pushName: string | null;
       profilePicUrl: string | null;
       updatedAt: Date | null;
       isGroup: boolean;
+      unreadMessages: number;
 
       lastMessageId: string | null;
       lastMessageKey: Prisma.JsonValue | null;
@@ -937,12 +949,12 @@ export class ChannelStartupService {
         ORDER BY m."key"->>'remoteJid', m."messageTimestamp" DESC
       )
       SELECT
-        c."id"                                     AS "contactId",
-        COALESCE(lm."remoteJid", c."remoteJid")    AS "remoteJid",
+        ch."id"                                    AS "chatId",
+        COALESCE(lm."remoteJid", ch."remoteJid")   AS "remoteJid",
         CASE
-          WHEN COALESCE(lm."remoteJid", c."remoteJid") LIKE '%@g.us'
-            THEN COALESCE(ch."name", c."pushName")
-          ELSE COALESCE(c."pushName", lm."lastMessagePushName")
+          WHEN COALESCE(lm."remoteJid", ch."remoteJid") LIKE '%@g.us'
+            THEN ch."name"
+          ELSE COALESCE(c."pushName", lm."lastMessagePushName", ch."name")
         END                                         AS "pushName",
         c."profilePicUrl"                           AS "profilePicUrl",
         COALESCE(
@@ -950,9 +962,10 @@ export class ChannelStartupService {
               THEN to_timestamp(lm."lastMessageMessageTimestamp"::double precision)
               ELSE NULL
           END,
-          c."updatedAt"
+          ch."updatedAt"
         )                                           AS "updatedAt",
-        (COALESCE(lm."remoteJid", c."remoteJid") LIKE '%@g.us') AS "isGroup",
+        (COALESCE(lm."remoteJid", ch."remoteJid") LIKE '%@g.us') AS "isGroup",
+        ch."unreadMessages"                         AS "unreadMessages",
 
         lm."lastMessageId",
         lm."lastMessageKey",
@@ -966,15 +979,15 @@ export class ChannelStartupService {
         lm."lastMessageInstanceId",
         lm."lastMessageSessionId",
         lm."lastMessageStatus"
-      FROM "Contact" c
+      FROM "Chat" ch
+      LEFT JOIN "Contact" c
+        ON c."remoteJid" = ch."remoteJid"
+      AND c."instanceId" = ch."instanceId"
       ${hasTsFilter
-        ? Prisma.sql`INNER JOIN last_msg lm ON lm."remoteJid" = c."remoteJid"`
-        : Prisma.sql`LEFT JOIN  last_msg lm ON lm."remoteJid" = c."remoteJid"`}
-      LEFT JOIN "Chat" ch
-        ON ch."remoteJid" = COALESCE(lm."remoteJid", c."remoteJid")
-      AND ch."instanceId" = c."instanceId"
-      WHERE c."instanceId" = ${this.instanceId}
-        ${remoteJid ? Prisma.sql`AND c."remoteJid" = ${remoteJid}` : Prisma.sql``}
+        ? Prisma.sql`INNER JOIN last_msg lm ON lm."remoteJid" = ch."remoteJid"`
+        : Prisma.sql`LEFT JOIN  last_msg lm ON lm."remoteJid" = ch."remoteJid"`}
+      WHERE ch."instanceId" = ${this.instanceId}
+        ${remoteJid ? Prisma.sql`AND ch."remoteJid" = ${remoteJid}` : Prisma.sql``}
       ORDER BY lm."lastMessageMessageTimestamp" DESC NULLS LAST
       ${limitSql}
       ${offsetSql};
@@ -993,12 +1006,15 @@ export class ChannelStartupService {
         ORDER BY m."key"->>'remoteJid', m."messageTimestamp" DESC
       )
       SELECT COUNT(*)::int AS total
-      FROM "Contact" c
+      FROM "Chat" ch
+      LEFT JOIN "Contact" c
+        ON c."remoteJid" = ch."remoteJid"
+      AND c."instanceId" = ch."instanceId"
       ${hasTsFilter
-        ? Prisma.sql`INNER JOIN last_msg lm ON lm."remoteJid" = c."remoteJid"`
-        : Prisma.sql`LEFT JOIN  last_msg lm ON lm."remoteJid" = c."remoteJid"`}
-      WHERE c."instanceId" = ${this.instanceId}
-        ${remoteJid ? Prisma.sql`AND c."remoteJid" = ${remoteJid}` : Prisma.sql``};
+        ? Prisma.sql`INNER JOIN last_msg lm ON lm."remoteJid" = ch."remoteJid"`
+        : Prisma.sql`LEFT JOIN  last_msg lm ON lm."remoteJid" = ch."remoteJid"`}
+      WHERE ch."instanceId" = ${this.instanceId}
+        ${remoteJid ? Prisma.sql`AND ch."remoteJid" = ${remoteJid}` : Prisma.sql``};
     `;
 
     const total = totalRows?.[0]?.total ?? 0;
@@ -1023,18 +1039,15 @@ export class ChannelStartupService {
         : undefined;
 
       return {
-        // body principal
         remoteJid: r.remoteJid,
         pushName: r.pushName ?? undefined,
         isGroup: r.isGroup,
-
-        // demais campos
-        id: r.contactId ?? null,
+        id: r.chatId ?? null,
         profilePicUrl: r.profilePicUrl ?? undefined,
         updatedAt: r.updatedAt ?? undefined,
         lastMessage: lastMessage ? this.cleanMessageData(lastMessage) : undefined,
-        unreadCount: 0,
-        isSaved: !!r.contactId,
+        unreadCount: r.unreadMessages ?? 0,
+        isSaved: !!r.chatId,
       };
     });
 
@@ -1046,6 +1059,7 @@ export class ChannelStartupService {
       hasMore: skip + take < total,
     };
   }
+
 
   public async fetchStatusMessage(query: any) {
     if (!query?.offset) {
