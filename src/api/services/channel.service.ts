@@ -678,57 +678,84 @@ export class ChannelStartupService {
   }
 
   public async fetchVezoMessages(query: Query<Message>) {
-  // -------- Paginação
-  const page = Number.isInteger(query?.page) ? Math.max(0, Number(query.page)) : 0;
-  const limit = Math.max(1, Number(query?.limit ?? 50) || 50);
-  const skip = page * limit;
+    // -------- Paginação
+    const page = Number.isInteger(query?.page) ? Math.max(0, Number(query.page)) : 0;
+    const limit = Math.max(1, Number(query?.limit ?? 50) || 50);
+    const skip = page * limit;
 
-  // -------- Filtros
-  const keyFilters = (query?.where as any)?.key ?? {};
-  const timestampFilter: Prisma.Sql[] = [];
+    // -------- Filtros
+    const keyFilters = (query?.where as any)?.key ?? {};
+    const timestampFilter: Prisma.Sql[] = [];
 
-  if ((query?.where as any)?.messageTimestamp) {
-    const mt = (query.where as any).messageTimestamp;
-    if (mt.gte)
-      timestampFilter.push(
-        Prisma.sql`m."messageTimestamp" >= ${Math.floor(new Date(mt.gte).getTime() / 1000)}`
-      );
-    if (mt.lte)
-      timestampFilter.push(
-        Prisma.sql`m."messageTimestamp" <= ${Math.floor(new Date(mt.lte).getTime() / 1000)}`
-      );
-  }
+    if ((query?.where as any)?.messageTimestamp) {
+      const mt = (query.where as any).messageTimestamp;
+      if (mt.gte)
+        timestampFilter.push(
+          Prisma.sql`m."messageTimestamp" >= ${Math.floor(new Date(mt.gte).getTime() / 1000)}`
+        );
+      if (mt.lte)
+        timestampFilter.push(
+          Prisma.sql`m."messageTimestamp" <= ${Math.floor(new Date(mt.lte).getTime() / 1000)}`
+        );
+    }
 
-  const messageTypeFilter =
-    (query?.where as any)?.messageType && (query.where as any).messageType !== 'reactionMessage'
-      ? Prisma.sql`m."messageType" = ${query.where.messageType}`
-      : Prisma.sql`m."messageType" != 'reactionMessage'`;
+    const messageTypeFilter =
+      (query?.where as any)?.messageType && (query.where as any).messageType !== 'reactionMessage'
+        ? Prisma.sql`m."messageType" = ${query.where.messageType}`
+        : Prisma.sql`m."messageType" != 'reactionMessage'`;
 
-  const jsonFilters: Prisma.Sql[] = [];
-  if (keyFilters?.id) jsonFilters.push(Prisma.sql`(m."key"->>'id') = ${keyFilters.id}`);
-  if (typeof keyFilters?.fromMe === 'boolean')
-    jsonFilters.push(Prisma.sql`(m."key"->>'fromMe')::boolean = ${keyFilters.fromMe}`);
-  if (keyFilters?.remoteJid)
-    jsonFilters.push(Prisma.sql`(m."key"->>'remoteJid') = ${keyFilters.remoteJid}`);
-  if (keyFilters?.participant)
-    jsonFilters.push(Prisma.sql`(m."key"->>'participant') = ${keyFilters.participant}`);
+    const jsonFilters: Prisma.Sql[] = [];
+    if (keyFilters?.id) jsonFilters.push(Prisma.sql`(m."key"->>'id') = ${keyFilters.id}`);
+    if (typeof keyFilters?.fromMe === 'boolean')
+      jsonFilters.push(Prisma.sql`(m."key"->>'fromMe')::boolean = ${keyFilters.fromMe}`);
+    if (keyFilters?.remoteJid)
+      jsonFilters.push(Prisma.sql`(m."key"->>'remoteJid') = ${keyFilters.remoteJid}`);
+    if (keyFilters?.participant)
+      jsonFilters.push(Prisma.sql`(m."key"->>'participant') = ${keyFilters.participant}`);
 
-  const whereClauses = [
-    Prisma.sql`m."instanceId" = ${this.instanceId}`,
-    messageTypeFilter,
-    ...timestampFilter,
-    ...jsonFilters,
-  ];
+    const whereClauses = [
+      Prisma.sql`m."instanceId" = ${this.instanceId}`,
+      messageTypeFilter,
+      ...timestampFilter,
+      ...jsonFilters,
+    ];
 
-  const whereSql = whereClauses.length
-    ? Prisma.sql`WHERE ${Prisma.join(whereClauses, ' AND ')}`
-    : Prisma.sql``;
+    const whereSql = whereClauses.length
+      ? Prisma.sql`WHERE ${Prisma.join(whereClauses, ' AND ')}`
+      : Prisma.sql``;
 
-  // -------- Mensagens deduplicadas
-  const messages = await this.prismaRepository.$queryRaw<Array<any>>`
-    SELECT *
-    FROM (
-      SELECT DISTINCT ON (m."key"->>'id', m."instanceId")
+    // -------- Mensagens deduplicadas (com MessageUpdate)
+    const messages = await this.prismaRepository.$queryRaw<Array<any>>`
+      SELECT
+        m.*,
+        COALESCE(
+          JSON_AGG(
+            DISTINCT JSONB_BUILD_OBJECT(
+              'status', mu."status",
+              'fromMe', mu."fromMe",
+              'participant', mu."participant",
+              'keyId', mu."keyId"
+            )
+          ) FILTER (WHERE mu."id" IS NOT NULL),
+          '[]'
+        ) AS "messageUpdates"
+      FROM (
+        SELECT DISTINCT ON (m."key"->>'id', m."instanceId")
+          m."id",
+          m."key",
+          m."pushName",
+          m."messageType",
+          m."message",
+          m."messageTimestamp",
+          m."instanceId",
+          m."source",
+          m."contextInfo"
+        FROM "Message" m
+        ${whereSql}
+        ORDER BY m."key"->>'id', m."instanceId", m."messageTimestamp" DESC
+      ) AS m
+      LEFT JOIN "MessageUpdate" mu ON mu."messageId" = m."id"
+      GROUP BY
         m."id",
         m."key",
         m."pushName",
@@ -738,133 +765,129 @@ export class ChannelStartupService {
         m."instanceId",
         m."source",
         m."contextInfo"
-      FROM "Message" m
-      ${whereSql}
-      ORDER BY m."key"->>'id', m."instanceId", m."messageTimestamp" DESC
-    ) AS deduped
-    ORDER BY deduped."messageTimestamp" DESC, deduped."id" DESC
-    LIMIT ${limit}
-    OFFSET ${skip};
-  `;
+      ORDER BY m."messageTimestamp" DESC, m."id" DESC
+      LIMIT ${limit}
+      OFFSET ${skip};
+    `;
 
-  // -------- Total de mensagens distintas
-  const totalRows = await this.prismaRepository.$queryRaw<Array<{ total: number }>>`
-    SELECT COUNT(*)::int AS total
-    FROM (
-      SELECT DISTINCT ON (m."key"->>'id', m."instanceId") 1
-      FROM "Message" m
-      ${whereSql}
-      ORDER BY m."key"->>'id', m."instanceId", m."messageTimestamp" DESC
-    ) AS distinct_msgs;
-  `;
-  const total = totalRows?.[0]?.total ?? 0;
+    // -------- Total de mensagens distintas
+    const totalRows = await this.prismaRepository.$queryRaw<Array<{ total: number }>>`
+      SELECT COUNT(*)::int AS total
+      FROM (
+        SELECT DISTINCT ON (m."key"->>'id', m."instanceId") 1
+        FROM "Message" m
+        ${whereSql}
+        ORDER BY m."key"->>'id', m."instanceId", m."messageTimestamp" DESC
+      ) AS distinct_msgs;
+    `;
+    const total = totalRows?.[0]?.total ?? 0;
 
-  // -------- Alvos das reações
-  type ParentTarget = { id: string; remoteJid?: string };
-  const parentTargets: ParentTarget[] = messages
-    .map((m) => {
+    // -------- Alvos das reações
+    type ParentTarget = { id: string; remoteJid?: string };
+    const parentTargets: ParentTarget[] = messages
+      .map((m) => {
+        const k = m.key as any;
+        const id = k?.id ? String(k.id) : undefined;
+        if (!id) return null;
+        return { id, remoteJid: k?.remoteJid ? String(k.remoteJid) : undefined };
+      })
+      .filter(Boolean) as ParentTarget[];
+
+    let reactionsByTarget = new Map<string, any[]>();
+
+    if (parentTargets.length > 0) {
+      const reactionWhereOR: Prisma.Sql[] = parentTargets.map((t) => {
+        const ands: Prisma.Sql[] = [
+          Prisma.sql`(m."message"->'reactionMessage'->'key'->>'id') = ${t.id}`,
+        ];
+        if (t.remoteJid) {
+          ands.push(
+            Prisma.sql`(m."message"->'reactionMessage'->'key'->>'remoteJid') = ${t.remoteJid}`
+          );
+        }
+        return Prisma.sql`(${Prisma.join(ands, ' AND ')})`;
+      });
+
+      const reactionWhere = Prisma.sql`
+        WHERE m."instanceId" = ${this.instanceId}
+          AND m."messageType" = 'reactionMessage'
+          ${reactionWhereOR.length ? Prisma.sql`AND (${Prisma.join(reactionWhereOR, ' OR ')})` : Prisma.sql``}
+      `;
+
+      const reactions = await this.prismaRepository.$queryRaw<Array<any>>`
+        SELECT *
+        FROM (
+          SELECT DISTINCT ON (
+            m."message"->'reactionMessage'->'key'->>'remoteJid',
+            m."message"->'reactionMessage'->'key'->>'id',
+            (m."key"->>'fromMe')::boolean
+          )
+            m."id",
+            m."key",
+            m."message",
+            m."messageTimestamp",
+            m."pushName",
+            m."source",
+            m."instanceId",
+            m."contextInfo"
+          FROM "Message" m
+          ${reactionWhere}
+          ORDER BY
+            m."message"->'reactionMessage'->'key'->>'remoteJid',
+            m."message"->'reactionMessage'->'key'->>'id',
+            (m."key"->>'fromMe')::boolean,
+            m."messageTimestamp" DESC
+        ) AS distinct_rx
+        ORDER BY distinct_rx."messageTimestamp" DESC;
+      `;
+
+      reactionsByTarget = reactions.reduce((map, rx) => {
+        const msg = rx.message as any;
+        const tgt = msg?.reactionMessage?.key;
+        const mapKey = `${tgt?.remoteJid ?? ''}::${tgt?.id ?? ''}`;
+
+        const data = {
+          id: rx.id,
+          emoji: msg?.reactionMessage?.text ?? null,
+          fromMe: (rx.key as any)?.fromMe ?? null,
+          by: (rx.key as any)?.participant ?? null,
+          remoteJid: tgt?.remoteJid ?? (rx.key as any)?.remoteJid ?? null,
+          senderTimestampMs: msg?.reactionMessage?.senderTimestampMs ?? null,
+          messageTimestamp: rx.messageTimestamp,
+          pushName: rx.pushName ?? null,
+          source: rx.source,
+          contextInfo: rx.contextInfo ?? null,
+        };
+
+        const arr = map.get(mapKey) ?? [];
+        arr.push(data);
+        map.set(mapKey, arr);
+        return map;
+      }, new Map<string, any[]>());
+    }
+
+    // -------- Anexar reações às mensagens
+    const recordsWithReactions = messages.map((m) => {
       const k = m.key as any;
-      const id = k?.id ? String(k.id) : undefined;
-      if (!id) return null;
-      return { id, remoteJid: k?.remoteJid ? String(k.remoteJid) : undefined };
-    })
-    .filter(Boolean) as ParentTarget[];
-
-  let reactionsByTarget = new Map<string, any[]>();
-
-  if (parentTargets.length > 0) {
-    const reactionWhereOR: Prisma.Sql[] = parentTargets.map((t) => {
-      const ands: Prisma.Sql[] = [
-        Prisma.sql`(m."message"->'reactionMessage'->'key'->>'id') = ${t.id}`,
-      ];
-      if (t.remoteJid) {
-        ands.push(
-          Prisma.sql`(m."message"->'reactionMessage'->'key'->>'remoteJid') = ${t.remoteJid}`
-        );
-      }
-      return Prisma.sql`(${Prisma.join(ands, ' AND ')})`;
+      const mapKey = `${k?.remoteJid ?? ''}::${k?.id ?? ''}`;
+      const reactions = reactionsByTarget.get(mapKey) ?? [];
+      return { ...m, reactions };
     });
 
-    const reactionWhere = Prisma.sql`
-      WHERE m."instanceId" = ${this.instanceId}
-        AND m."messageType" = 'reactionMessage'
-        ${reactionWhereOR.length ? Prisma.sql`AND (${Prisma.join(reactionWhereOR, ' OR ')})` : Prisma.sql``}
-    `;
+    // -------- Paginação
+    const pages = total === 0 ? 0 : Math.ceil(total / limit);
 
-    // -------- Reações deduplicadas (uma por fromMe)
-    const reactions = await this.prismaRepository.$queryRaw<Array<any>>`
-      SELECT *
-      FROM (
-        SELECT DISTINCT ON (
-          m."message"->'reactionMessage'->'key'->>'remoteJid',
-          m."message"->'reactionMessage'->'key'->>'id',
-          (m."key"->>'fromMe')::boolean
-        )
-          m."id",
-          m."key",
-          m."message",
-          m."messageTimestamp",
-          m."pushName",
-          m."source",
-          m."instanceId",
-          m."contextInfo"
-        FROM "Message" m
-        ${reactionWhere}
-        ORDER BY
-          m."message"->'reactionMessage'->'key'->>'remoteJid',
-          m."message"->'reactionMessage'->'key'->>'id',
-          (m."key"->>'fromMe')::boolean,
-          m."messageTimestamp" DESC
-      ) AS distinct_rx
-      ORDER BY distinct_rx."messageTimestamp" DESC;
-    `;
-
-    reactionsByTarget = reactions.reduce((map, rx) => {
-      const msg = rx.message as any;
-      const tgt = msg?.reactionMessage?.key;
-      const mapKey = `${tgt?.remoteJid ?? ''}::${tgt?.id ?? ''}`;
-
-      const data = {
-        id: rx.id,
-        emoji: msg?.reactionMessage?.text ?? null,
-        fromMe: (rx.key as any)?.fromMe ?? null,
-        by: (rx.key as any)?.participant ?? null,
-        remoteJid: tgt?.remoteJid ?? (rx.key as any)?.remoteJid ?? null,
-        senderTimestampMs: msg?.reactionMessage?.senderTimestampMs ?? null,
-        messageTimestamp: rx.messageTimestamp,
-        pushName: rx.pushName ?? null,
-        source: rx.source,
-        contextInfo: rx.contextInfo ?? null,
-      };
-
-      const arr = map.get(mapKey) ?? [];
-      arr.push(data);
-      map.set(mapKey, arr);
-      return map;
-    }, new Map<string, any[]>());
+    return {
+      messages: {
+        total,
+        pages,
+        currentPage: page,
+        limit,
+        records: recordsWithReactions,
+      },
+    };
   }
 
-  // -------- Anexar reações às mensagens
-  const recordsWithReactions = messages.map((m) => {
-    const k = m.key as any;
-    const mapKey = `${k?.remoteJid ?? ''}::${k?.id ?? ''}`;
-    const reactions = reactionsByTarget.get(mapKey) ?? [];
-    return { ...m, reactions };
-  });
-
-  // -------- Paginação
-  const pages = total === 0 ? 0 : Math.ceil(total / limit);
-
-  return {
-    messages: {
-      total,
-      pages,
-      currentPage: page,
-      limit,
-      records: recordsWithReactions,
-    },
-  };
-}
 
 
   public async fetchVezoChats(query: {
