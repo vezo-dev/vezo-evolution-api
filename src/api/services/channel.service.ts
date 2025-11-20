@@ -705,13 +705,31 @@ export class ChannelStartupService {
         : Prisma.sql`m."messageType" != 'reactionMessage'`;
 
     const jsonFilters: Prisma.Sql[] = [];
-    if (keyFilters?.id) jsonFilters.push(Prisma.sql`(m."key"->>'id') = ${keyFilters.id}`);
+
+    if (keyFilters?.id)
+      jsonFilters.push(Prisma.sql`(m."key"->>'id') = ${keyFilters.id}`);
+
     if (typeof keyFilters?.fromMe === 'boolean')
-      jsonFilters.push(Prisma.sql`(m."key"->>'fromMe')::boolean = ${keyFilters.fromMe}`);
+      jsonFilters.push(
+        Prisma.sql`(m."key"->>'fromMe')::boolean = ${keyFilters.fromMe}`
+      );
+
+    // Aqui entra o NOVO: remoteJid OU remoteJidAlt
     if (keyFilters?.remoteJid)
-      jsonFilters.push(Prisma.sql`(m."key"->>'remoteJid') = ${keyFilters.remoteJid}`);
+      jsonFilters.push(
+        Prisma.sql`
+          (
+            (m."key"->>'remoteJid') = ${keyFilters.remoteJid}
+            OR
+            (m."key"->>'remoteJidAlt') = ${keyFilters.remoteJid}
+          )
+        `
+      );
+
     if (keyFilters?.participant)
-      jsonFilters.push(Prisma.sql`(m."key"->>'participant') = ${keyFilters.participant}`);
+      jsonFilters.push(
+        Prisma.sql`(m."key"->>'participant') = ${keyFilters.participant}`
+      );
 
     const whereClauses = [
       Prisma.sql`m."instanceId" = ${this.instanceId}`,
@@ -724,7 +742,7 @@ export class ChannelStartupService {
       ? Prisma.sql`WHERE ${Prisma.join(whereClauses, ' AND ')}`
       : Prisma.sql``;
 
-    // -------- Mensagens deduplicadas (com MessageUpdate)
+    // -------- Mensagens deduplicadas + MessageUpdate
     const messages = await this.prismaRepository.$queryRaw<Array<any>>`
       SELECT
         m.*,
@@ -771,7 +789,9 @@ export class ChannelStartupService {
     `;
 
     // -------- Total de mensagens distintas
-    const totalRows = await this.prismaRepository.$queryRaw<Array<{ total: number }>>`
+    const totalRows = await this.prismaRepository.$queryRaw<
+      Array<{ total: number }>
+    >`
       SELECT COUNT(*)::int AS total
       FROM (
         SELECT DISTINCT ON (m."key"->>'id', m."instanceId") 1
@@ -783,13 +803,17 @@ export class ChannelStartupService {
     const total = totalRows?.[0]?.total ?? 0;
 
     // -------- Alvos das reações
-    type ParentTarget = { id: string; remoteJid?: string };
+    type ParentTarget = { id: string; remoteJid?: string; remoteJidAlt?: string };
     const parentTargets: ParentTarget[] = messages
       .map((m) => {
         const k = m.key as any;
         const id = k?.id ? String(k.id) : undefined;
         if (!id) return null;
-        return { id, remoteJid: k?.remoteJid ? String(k.remoteJid) : undefined };
+        return {
+          id,
+          remoteJid: k?.remoteJid ? String(k.remoteJid) : undefined,
+          remoteJidAlt: k?.remoteJidAlt ? String(k.remoteJidAlt) : undefined,
+        };
       })
       .filter(Boolean) as ParentTarget[];
 
@@ -800,18 +824,23 @@ export class ChannelStartupService {
         const ands: Prisma.Sql[] = [
           Prisma.sql`(m."message"->'reactionMessage'->'key'->>'id') = ${t.id}`,
         ];
-        if (t.remoteJid) {
+
+        if (t.remoteJid)
           ands.push(
             Prisma.sql`(m."message"->'reactionMessage'->'key'->>'remoteJid') = ${t.remoteJid}`
           );
-        }
+
+        // reaction NÃO possui remoteJidAlt → ignorado
+
         return Prisma.sql`(${Prisma.join(ands, ' AND ')})`;
       });
 
       const reactionWhere = Prisma.sql`
         WHERE m."instanceId" = ${this.instanceId}
           AND m."messageType" = 'reactionMessage'
-          ${reactionWhereOR.length ? Prisma.sql`AND (${Prisma.join(reactionWhereOR, ' OR ')})` : Prisma.sql``}
+          ${reactionWhereOR.length
+            ? Prisma.sql`AND (${Prisma.join(reactionWhereOR, ' OR ')})`
+            : Prisma.sql``}
       `;
 
       const reactions = await this.prismaRepository.$queryRaw<Array<any>>`
@@ -851,7 +880,7 @@ export class ChannelStartupService {
           emoji: msg?.reactionMessage?.text ?? null,
           fromMe: (rx.key as any)?.fromMe ?? null,
           by: (rx.key as any)?.participant ?? null,
-          remoteJid: tgt?.remoteJid ?? (rx.key as any)?.remoteJid ?? null,
+          remoteJid: tgt?.remoteJid ?? null,
           senderTimestampMs: msg?.reactionMessage?.senderTimestampMs ?? null,
           messageTimestamp: rx.messageTimestamp,
           pushName: rx.pushName ?? null,
@@ -866,10 +895,10 @@ export class ChannelStartupService {
       }, new Map<string, any[]>());
     }
 
-    // -------- Anexar reações às mensagens
+    // -------- Anexar reações
     const recordsWithReactions = messages.map((m) => {
       const k = m.key as any;
-      const mapKey = `${k?.remoteJid ?? ''}::${k?.id ?? ''}`;
+      const mapKey = `${k?.remoteJid ?? ''}::${k?.id ?? ''}`; // remoteJidAlt não existe nas reações!
       const reactions = reactionsByTarget.get(mapKey) ?? [];
       return { ...m, reactions };
     });
